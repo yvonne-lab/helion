@@ -27,6 +27,9 @@ from torch._inductor.virtualized import V
 from ._inductor.template_buffer import HelionTemplateBuffer
 from helion._compiler._dynamo.higher_order_ops import get_helion_kernel
 from helion._compiler._dynamo.higher_order_ops import (
+    helion_kernel_wrapper_functional as _helion_functional_hop,
+)
+from helion._compiler._dynamo.higher_order_ops import (
     helion_kernel_wrapper_mutation as _helion_hop,
 )
 
@@ -174,68 +177,19 @@ def var_mean(
     )
 
 
-def _clone_mutated_graph_output_inputs(
-    mutated_names: set[str],
-    realized: dict[str, IRNode],
+def _clone_tensor(
+    ir_node: IRNode,
     realize_fn: Callable[[TensorBox], IRNode],
-) -> None:
-    """Clone realized inputs that are mutated AND also appear as graph outputs.
-
-    When AOT autograd eliminates a user's clone, a mutated input may also
-    appear as a graph output that should retain its pre-mutation value.
-    This replaces the entry in ``realized`` with a fresh copy so the HOP
-    mutates the copy while the original buffer (still in V.graph.env)
-    remains available unmutated for the graph output.
-    """
-    current_node: torch.fx.Node | None = getattr(V.graph, "current_node", None)
-    if current_node is None:
-        return
-    fx_tensor_args = current_node.kwargs.get("tensor_args", {})
-    if not fx_tensor_args:
-        return
-
-    # Collect FX nodes that are direct graph outputs
-    output_fx_nodes: set[torch.fx.Node] = set()
-    for fx_node in V.graph.module.graph.nodes:
-        if fx_node.op == "output":
-
-            def _collect(arg: object) -> None:
-                if isinstance(arg, torch.fx.Node):
-                    output_fx_nodes.add(arg)
-                elif isinstance(arg, (tuple, list)):
-                    for a in arg:
-                        _collect(a)
-
-            _collect(fx_node.args)
-            break
-
-    if not output_fx_nodes:
-        return
-
-    # Track cloned FX nodes so multiple args pointing to the same node
-    # (identical aliased inputs) share a single clone buffer.
-    cloned: dict[torch.fx.Node, IRNode] = {}
-    for name in mutated_names:
-        fx_arg_node = fx_tensor_args.get(name)
-        if (
-            isinstance(fx_arg_node, torch.fx.Node)
-            and fx_arg_node in output_fx_nodes
-            and name in realized
-        ):
-            if fx_arg_node in cloned:
-                realized[name] = cloned[fx_arg_node]
-            else:
-                orig = realized[name]
-                clone_tb = Pointwise.create(
-                    device=orig.get_device(),
-                    dtype=orig.get_dtype(),
-                    inner_fn=orig.make_loader(),
-                    ranges=list(orig.get_size()),
-                )
-                assert isinstance(clone_tb, TensorBox)
-                clone_ir = realize_fn(clone_tb)
-                realized[name] = clone_ir
-                cloned[fx_arg_node] = clone_ir
+) -> IRNode:
+    """Clone an IR node by creating a Pointwise copy."""
+    clone_tb = Pointwise.create(
+        device=ir_node.get_device(),
+        dtype=ir_node.get_dtype(),
+        inner_fn=ir_node.make_loader(),
+        ranges=list(ir_node.get_size()),
+    )
+    assert isinstance(clone_tb, TensorBox)
+    return realize_fn(clone_tb)
 
 
 @register_lowering(_helion_hop, type_promotion_kind=None)
@@ -267,14 +221,6 @@ def lower_helion_kernel(
     realized = {
         n: realize(tb) for n, tb in tensor_args.items() if isinstance(tb, TensorBox)
     }
-
-    # Clone mutated inputs that are also graph outputs.  After AOT autograd
-    # eliminates a user's clone, the mutated input and graph output share
-    # the same buffer.  By giving the HOP a fresh copy, the original buffer
-    # (still referenced via V.graph.env) stays unmutated for the graph output.
-    mutated_names = set(cast("list[str]", output_spec.get("mutated_inputs", [])))
-    if mutated_names:
-        _clone_mutated_graph_output_inputs(mutated_names, realized, realize)
 
     # Build ordered arg_names and inputs lists from realized
     arg_names = list(realized.keys())
@@ -421,3 +367,85 @@ def lower_helion_kernel(
                 buf.layout = fallback
 
     return tuple(results)
+
+
+@register_lowering(_helion_functional_hop, type_promotion_kind=None)
+def lower_helion_kernel_functional(
+    *,
+    kernel_idx: int,
+    constant_args: dict[str, object],
+    tensor_args: dict[str, TensorBox],
+    output_spec: dict[str, object],
+    tensors_to_clone: list[str],
+) -> tuple[tuple[TensorBox | int | float | None, ...], dict[str, TensorBox]]:
+    """Lower the functional Helion kernel HOP.
+
+    This HOP is used after functionalization. It:
+    1. Clones the tensors specified in tensors_to_clone
+    2. Calls the core kernel lowering with cloned inputs
+    3. Returns both kernel outputs and the cloned tensors
+    """
+    # Realize inputs: convert TensorBox to buffer/ReinterpretView
+    def realize(tb: TensorBox) -> IRNode:
+        result = ExternKernel.realize_input(tb)
+        if isinstance(result, StorageBox):
+            result = result.data
+        if isinstance(getattr(result, "layout", None), FlexibleLayout):
+            result.freeze_layout()
+        return result
+
+    # Clone specified tensors before passing to kernel.
+    # Use same_tensor_groups to decide when to share clones:
+    # - If two args are in the same group (originally same proxy at Dynamo), share clone
+    # - If two args point to same TensorBox but NOT in same group, need separate clones
+    #   (this happens when user calls kernel(x.clone(), x.clone()) - after noop pass
+    #   both point to same tensor, but they were originally separate clones)
+    same_tensor_groups = cast(
+        "list[list[str]]", output_spec.get("same_tensor_groups", [])
+    )
+    # Build a mapping from arg name to its group (for quick lookup)
+    name_to_group: dict[str, int] = {}
+    for group_idx, group in enumerate(same_tensor_groups):
+        for name in group:
+            name_to_group[name] = group_idx
+
+    # For clone deduplication, we key by (tensorbox_id, group_idx).
+    # Args in the same group AND same tensorbox share a clone.
+    # Args NOT in any group get their own clone (no sharing even if same tensorbox).
+    clone_key_to_clone: dict[tuple[int, int], TensorBox] = {}
+    cloned_tensor_args: dict[str, TensorBox] = {}
+    unique_counter = 0  # For args not in any group, give each a unique "group"
+    for name, tb in tensor_args.items():
+        if isinstance(tb, TensorBox) and name in tensors_to_clone:
+            tid = id(tb)
+            group_idx = name_to_group.get(name)
+            if group_idx is None:
+                # Not in any group - give it a unique "group" so it doesn't share
+                unique_counter -= 1  # Use negative numbers to avoid collision
+                group_idx = unique_counter
+            clone_key = (tid, group_idx)
+            if clone_key not in clone_key_to_clone:
+                # Clone the tensor
+                ir_node = realize(tb)
+                cloned_ir = _clone_tensor(ir_node, realize)
+                clone_key_to_clone[clone_key] = TensorBox.create(cloned_ir)
+            cloned_tensor_args[name] = clone_key_to_clone[clone_key]
+        else:
+            cloned_tensor_args[name] = tb
+
+    # Call the core kernel lowering with cloned inputs
+    kernel_outputs = lower_helion_kernel(
+        kernel_idx=kernel_idx,
+        constant_args=constant_args,
+        tensor_args=cloned_tensor_args,
+        output_spec=output_spec,
+    )
+
+    # Build dict of cloned tensors for functionalization
+    cloned_tensors_out = {
+        name: cloned_tensor_args[name]
+        for name in tensors_to_clone
+        if name in cloned_tensor_args
+    }
+
+    return (kernel_outputs, cloned_tensors_out)

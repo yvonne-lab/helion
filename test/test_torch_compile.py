@@ -352,6 +352,45 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         # Compare results
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
+    def _run_clone_then_view_mutate_test(
+        self,
+        view_fn,
+        y_fn=None,
+        input_shape=(4, 8),
+        warmup_shape=None,
+    ):
+        """
+        Helper for clone-then-view-mutate tests.
+
+        Args:
+            view_fn: Function that takes x_clone and returns a view of it.
+                     Can be a lambda like `lambda x: x.t()` or `lambda x: torch.positive(x)`.
+            y_fn: Optional function to transform y to match the view shape.
+                  If None, y is used as-is. Example: `lambda y: y.t()` for transpose.
+            input_shape: Shape of input tensors (default (4, 8)).
+            warmup_shape: Shape for warmup tensors. If None, uses same as input.
+        """
+        y_transform = y_fn if y_fn is not None else (lambda y: y)
+        warmup_shape = warmup_shape or input_shape
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            x_clone = x.clone()
+            x_view = view_fn(x_clone)
+            y_view = y_transform(y)
+            result = k_add_inplace(x_view, y_view)
+            result = torch.relu(result) + 1.0
+            return result, x.sum()
+
+        x = torch.randn(*input_shape, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(*input_shape, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            torch.randn(*warmup_shape, device=DEVICE, dtype=torch.float16),
+            torch.randn(*warmup_shape, device=DEVICE, dtype=torch.float16),
+        )
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_add_kernel(self):
@@ -1540,7 +1579,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         self._run_compile_test(f, k_add_inplace, (x, y))
 
-    @unittest.expectedFailure  # Known limitation: indirect outputs not yet supported
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_transform_original(self):
@@ -1548,11 +1586,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         This tests that computations on the original (like x + 1) use the
         pre-mutation value, not the mutated value.
-
-        NOTE: This is an expected failure. The current fix only handles cases
-        where the mutated input's FX node appears DIRECTLY as a graph output.
-        When the original is used in an intermediate computation (x + 1.0),
-        the FX output node is different from the original input node.
         """
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1598,7 +1631,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
         self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
 
-    @unittest.expectedFailure  # Known limitation: complex view aliasing not yet supported
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_of_view_then_mutate(self):
@@ -1606,10 +1638,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         This tests that cloning a view and mutating the clone doesn't affect
         the original base tensor.
-
-        NOTE: This is an expected failure. When the clone is on a view (x.view(-1)),
-        the aliasing relationship between the view and the original tensor
-        is complex and not currently handled by the cloning fix.
         """
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1659,17 +1687,12 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         )
         self._run_compile_test(f, k_add_inplace, (x,), warmup_args=warmup)
 
-    @unittest.expectedFailure  # Known limitation: complex view aliasing not yet supported
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_transposed(self):
         """Test: clone transposed tensor, mutate clone, original unchanged.
 
         This tests non-contiguous tensor handling in the clone-then-mutate pattern.
-
-        NOTE: This is an expected failure. When the clone is on a view (x.T),
-        the aliasing relationship between the view and the original tensor
-        is complex and not currently handled by the cloning fix.
         """
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1769,7 +1792,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         _ = k_add_to_three(*warmup)
         self._run_compile_test(f, k_add_to_three, (w,), warmup_args=warmup)
 
-    @unittest.expectedFailure  # Known limitation: indirect outputs not yet supported
     @skipIfRocm("torch.compile missing kernel metadata on ROCm")
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_original_reduction_as_output(self):
@@ -1777,11 +1799,6 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         This tests that reductions (like sum) on the original use the
         pre-mutation value.
-
-        NOTE: This is an expected failure. The current fix only handles cases
-        where the mutated input's FX node appears DIRECTLY as a graph output.
-        When the original is reduced (x.sum()), the FX output node is a
-        reduction node, not the original input node.
         """
 
         def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1818,6 +1835,948 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
         self._run_compile_test(f, k_add_inplace, (x, y))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_flatten_mutate(self):
+        """Test: clone then flatten (a view op), mutate, original unchanged.
+
+        This tests that clone detection correctly traces through flatten().
+        flatten() is a view operation - mutating through it affects the clone's
+        storage but not the original tensor.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """1D in-place add for flattened tensors."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_1d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then flatten - flatten is a view
+            x_clone = x.clone()
+            x_flat = x_clone.flatten()
+            y_flat = y.flatten()
+            result = k_add_inplace_1d(x_flat, y_flat)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.flatten().clone(), y.flatten().clone())
+        k_add_inplace_1d.reset()
+        _ = k_add_inplace_1d(*warmup)
+        self._run_compile_test(f, k_add_inplace_1d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_narrow_mutate(self):
+        """Test: clone then narrow (a view op), mutate, original unchanged.
+
+        This tests that clone detection correctly traces through narrow().
+        narrow() is a view operation - mutating through it affects the clone's
+        storage but not the original tensor.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then narrow - narrow is a view
+            x_clone = x.clone()
+            x_narrow = x_clone.narrow(0, 0, 4)  # first 4 rows
+            y_narrow = y.narrow(0, 0, 4)
+            result = k_add_inplace(x_narrow, y_narrow)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        # Use 8x8 tensor so narrow gives us 4x8
+        x = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.narrow(0, 0, 4).clone(), y.narrow(0, 0, 4).clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_select_mutate(self):
+        """Test: clone then select (a view op), mutate, original unchanged.
+
+        This tests that clone detection correctly traces through select().
+        select() is a view operation that reduces dimensionality.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """1D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_1d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then select first row - select is a view
+            x_clone = x.clone()
+            x_row = x_clone.select(0, 0)  # shape (8,)
+            y_row = y.select(0, 0)
+            result = k_add_inplace_1d(x_row, y_row)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.select(0, 0).clone(), y.select(0, 0).clone())
+        k_add_inplace_1d.reset()
+        _ = k_add_inplace_1d(*warmup)
+        self._run_compile_test(f, k_add_inplace_1d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_slice_indexing_mutate(self):
+        """Test: clone then slice with Python indexing syntax, mutate, original unchanged.
+
+        This tests that clone detection correctly traces through slice operations
+        created by Python's [] indexing syntax (e.g., x[:, :4]).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then slice using Python [] syntax - this creates slice ops
+            x_clone = x.clone()
+            x_slice = x_clone[:, :4]  # slice first 4 columns
+            y_slice = y[:, :4]
+            result = k_add_inplace(x_slice, y_slice)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x[:, :4].clone(), y[:, :4].clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_unfold_mutate(self):
+        """Test: clone then unfold (a view op), mutate, original unchanged.
+
+        This tests that clone detection correctly traces through unfold().
+        unfold() creates a view with a sliding window.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """3D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_3d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then unfold - unfold is a view
+            x_clone = x.clone()
+            # unfold(dimension, size, step) - creates sliding window view
+            x_unfold = x_clone.unfold(1, 4, 4)  # (4, 2, 4) from (4, 8)
+            y_unfold = y.unfold(1, 4, 4)
+            result = k_add_inplace_3d(x_unfold, y_unfold)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.unfold(1, 4, 4).clone(), y.unfold(1, 4, 4).clone())
+        k_add_inplace_3d.reset()
+        _ = k_add_inplace_3d(*warmup)
+        self._run_compile_test(f, k_add_inplace_3d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_unbind_mutate(self):
+        """Test: clone then unbind (returns tuple of views), mutate one slice.
+
+        unbind() splits tensor into a tuple of views - tests tuple indexing path.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """1D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_1d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then unbind - unbind returns tuple of views
+            x_clone = x.clone()
+            x_slices = x_clone.unbind(0)  # tuple of 4 views, each shape (8,)
+            y_slices = y.unbind(0)
+            # Mutate the first slice
+            result = k_add_inplace_1d(x_slices[0], y_slices[0])
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x[0].clone(), y[0].clone())
+        k_add_inplace_1d.reset()
+        _ = k_add_inplace_1d(*warmup)
+        self._run_compile_test(f, k_add_inplace_1d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_diagonal_mutate(self):
+        """Test: clone then diagonal (a view op), mutate, original unchanged.
+
+        diagonal() returns a view of the diagonal elements.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """1D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_1d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then diagonal - diagonal is a view
+            x_clone = x.clone()
+            x_diag = x_clone.diagonal()  # (4,) from (4, 4)
+            y_diag = y.diagonal()
+            result = k_add_inplace_1d(x_diag, y_diag)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 4, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 4, device=DEVICE, dtype=torch.float16)
+        warmup = (x.diagonal().clone(), y.diagonal().clone())
+        k_add_inplace_1d.reset()
+        _ = k_add_inplace_1d(*warmup)
+        self._run_compile_test(f, k_add_inplace_1d, (x, y), warmup_args=warmup)
+
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_broadcast_to_mutate(self):
+        """Test: clone then broadcast_to (a view op), mutate, original unchanged.
+
+        torch.broadcast_to() returns a view with expanded dimensions.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """3D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_3d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then broadcast_to - broadcast_to is a view
+            x_clone = x.clone()
+            x_broadcast = torch.broadcast_to(x_clone, (2, 4, 8))  # (2, 4, 8) from (4, 8)
+            y_broadcast = torch.broadcast_to(y, (2, 4, 8))
+            result = k_add_inplace_3d(x_broadcast, y_broadcast)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            torch.broadcast_to(x.clone(), (2, 4, 8)).clone(),
+            torch.broadcast_to(y.clone(), (2, 4, 8)).clone(),
+        )
+        k_add_inplace_3d.reset()
+        _ = k_add_inplace_3d(*warmup)
+        self._run_compile_test(f, k_add_inplace_3d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_expand_as_mutate(self):
+        """Test: clone then expand_as (a view op), mutate, original unchanged.
+
+        expand_as() expands tensor to match another tensor's shape (view).
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """3D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_3d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then expand_as - expand_as is a view
+            x_clone = x.clone()
+            template = torch.zeros(2, 4, 8, device=x.device, dtype=x.dtype)
+            x_expanded = x_clone.expand_as(template)  # (2, 4, 8) from (4, 8)
+            y_expanded = y.expand_as(template)
+            result = k_add_inplace_3d(x_expanded, y_expanded)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        template = torch.zeros(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            x.expand_as(template).clone(),
+            y.expand_as(template).clone(),
+        )
+        k_add_inplace_3d.reset()
+        _ = k_add_inplace_3d(*warmup)
+        self._run_compile_test(f, k_add_inplace_3d, (x, y), warmup_args=warmup)
+
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_view_as_mutate(self):
+        """Test: clone then view_as (a view op), mutate, original unchanged.
+
+        view_as() reshapes tensor to match another tensor's shape (view).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then view_as - view_as is a view
+            x_clone = x.clone()
+            template = torch.zeros(8, 4, device=x.device, dtype=x.dtype)
+            x_viewed = x_clone.view_as(template)  # (8, 4) from (4, 8)
+            y_viewed = y.view_as(template)
+            result = k_add_inplace(x_viewed, y_viewed)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        template = torch.zeros(8, 4, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            x.view_as(template).clone(),
+            y.view_as(template).clone(),
+        )
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_reshape_as_mutate(self):
+        """Test: clone then reshape_as (a view op), mutate, original unchanged.
+
+        reshape_as() reshapes tensor to match another tensor's shape (view when possible).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then reshape_as - reshape_as is a view when contiguous
+            x_clone = x.clone()
+            template = torch.zeros(8, 4, device=x.device, dtype=x.dtype)
+            x_reshaped = x_clone.reshape_as(template)  # (8, 4) from (4, 8)
+            y_reshaped = y.reshape_as(template)
+            result = k_add_inplace(x_reshaped, y_reshaped)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        template = torch.zeros(8, 4, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            x.reshape_as(template).clone(),
+            y.reshape_as(template).clone(),
+        )
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_ravel_mutate(self):
+        """Test: clone then ravel (a view op), mutate, original unchanged.
+
+        ravel() returns a flattened view (when contiguous) or copy.
+        For contiguous tensors, ravel() returns a view.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then ravel - ravel returns a flattened view for contiguous tensors
+            x_clone = x.clone()
+            x_raveled = x_clone.ravel()  # (32,) from (4, 8)
+            y_raveled = y.ravel()
+            result = k_add_inplace(x_raveled, y_raveled)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.ravel().clone(), y.ravel().clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_hsplit_mutate(self):
+        """Test: clone then hsplit (returns tuple of views), mutate one slice.
+
+        torch.hsplit() horizontally splits array into multiple sub-arrays (views).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then hsplit - hsplit returns tuple of views
+            x_clone = x.clone()
+            x_parts = torch.hsplit(x_clone, 2)  # split (4, 8) -> 2x (4, 4)
+            y_parts = torch.hsplit(y, 2)
+            # Mutate just the first part
+            result = k_add_inplace(x_parts[0], y_parts[0])
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x[:, :4].clone(), y[:, :4].clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_split_with_sizes_mutate(self):
+        """Test: clone then split_with_sizes (returns tuple of views), mutate one slice.
+
+        torch.split_with_sizes() splits tensor into chunks with specified sizes (views).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then split_with_sizes - returns tuple of views
+            x_clone = x.clone()
+            # split (4, 8) along dim=1 into sizes [3, 5]
+            x_parts = torch.split_with_sizes(x_clone, [3, 5], dim=1)
+            y_parts = torch.split_with_sizes(y, [3, 5], dim=1)
+            # Mutate just the first part (4, 3)
+            result = k_add_inplace(x_parts[0], y_parts[0])
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x[:, :3].clone(), y[:, :3].clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_contiguous_then_view_mutate(self):
+        """Test: clone then contiguous then view, mutate, original unchanged.
+
+        This tests that clone detection correctly traces through contiguous().
+        For an already contiguous tensor, contiguous() returns self (a view).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then contiguous (no-op for contiguous tensor) then view
+            x_clone = x.clone()
+            x_contig = x_clone.contiguous()
+            x_view = x_contig.view(8, 4)  # Different shape
+            y_view = y.view(8, 4)
+            result = k_add_inplace(x_view, y_view)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.view(8, 4).clone(), y.view(8, 4).clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_positive_mutate(self):
+        """Test: clone then torch.positive (a view op), mutate, original unchanged.
+
+        torch.positive() returns the input tensor unchanged for non-complex tensors.
+        It's a view operation - tests that is_view detection works for it.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then positive - positive returns input unchanged (view)
+            x_clone = x.clone()
+            x_pos = torch.positive(x_clone)
+            y_pos = torch.positive(y)
+            result = k_add_inplace(x_pos, y_pos)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (torch.positive(x.clone()), torch.positive(y.clone()))
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_detach_then_view_mutate(self):
+        """Test: clone then detach then view, mutate, original unchanged.
+
+        This tests that clone detection correctly traces through detach().
+        detach() returns a view that shares storage but doesn't require grad.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then detach then view
+            x_clone = x.clone()
+            x_detach = x_clone.detach()
+            x_view = x_detach.view(8, 4)
+            y_view = y.detach().view(8, 4)
+            result = k_add_inplace(x_view, y_view)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.view(8, 4).clone(), y.view(8, 4).clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_multiple_chained_views_mutate(self):
+        """Test: clone then many chained view ops, mutate, original unchanged.
+
+        This tests that clone detection correctly traces through multiple
+        consecutive view operations: clone -> t -> contiguous -> view -> flatten -> mutate
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """1D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_1d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then multiple chained views
+            x_clone = x.clone()
+            x_t = x_clone.t()  # (8, 4)
+            x_contig = x_t.contiguous()  # Makes a copy since t() is non-contiguous!
+            x_view = x_contig.view(32)  # (32,)
+            y_flat = y.flatten()
+            result = k_add_inplace_1d(x_view, y_flat)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.t().contiguous().view(32).clone(), y.flatten().clone())
+        k_add_inplace_1d.reset()
+        _ = k_add_inplace_1d(*warmup)
+        self._run_compile_test(f, k_add_inplace_1d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_chunk_mutate(self):
+        """Test: clone then chunk (returns tuple of views), mutate one chunk.
+
+        torch.chunk() splits tensor into chunks (views).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then chunk - chunk returns tuple of views
+            x_clone = x.clone()
+            x_chunks = torch.chunk(x_clone, 2, dim=0)  # split (4, 8) -> 2x (2, 8)
+            y_chunks = torch.chunk(y, 2, dim=0)
+            # Mutate just the first chunk
+            result = k_add_inplace(x_chunks[0], y_chunks[0])
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x[:2, :].clone(), y[:2, :].clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_tensor_split_mutate(self):
+        """Test: clone then tensor_split (returns tuple of views), mutate one part.
+
+        torch.tensor_split() splits tensor into parts (views).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then tensor_split - tensor_split returns tuple of views
+            x_clone = x.clone()
+            x_parts = torch.tensor_split(x_clone, 2, dim=1)  # split (4, 8) -> 2x (4, 4)
+            y_parts = torch.tensor_split(y, 2, dim=1)
+            # Mutate just the first part
+            result = k_add_inplace(x_parts[0], y_parts[0])
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x[:, :4].clone(), y[:, :4].clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_movedim_mutate(self):
+        """Test: clone then movedim (a view op), mutate, original unchanged.
+
+        torch.movedim() returns a view with moved dimensions.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """3D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_3d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then movedim - movedim is a view
+            x_clone = x.clone()
+            x_moved = torch.movedim(x_clone, 0, 2)  # (4, 8, 2) from (2, 4, 8)
+            y_moved = torch.movedim(y, 0, 2)
+            result = k_add_inplace_3d(x_moved, y_moved)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (torch.movedim(x.clone(), 0, 2), torch.movedim(y.clone(), 0, 2))
+        k_add_inplace_3d.reset()
+        _ = k_add_inplace_3d(*warmup)
+        self._run_compile_test(f, k_add_inplace_3d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_swapaxes_mutate(self):
+        """Test: clone then swapaxes (a view op), mutate, original unchanged.
+
+        torch.swapaxes() swaps two axes (view).
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """3D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_3d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then swapaxes - swapaxes is a view
+            x_clone = x.clone()
+            x_swapped = torch.swapaxes(x_clone, 0, 1)  # (4, 2, 8) from (2, 4, 8)
+            y_swapped = torch.swapaxes(y, 0, 1)
+            result = k_add_inplace_3d(x_swapped, y_swapped)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (torch.swapaxes(x.clone(), 0, 1), torch.swapaxes(y.clone(), 0, 1))
+        k_add_inplace_3d.reset()
+        _ = k_add_inplace_3d(*warmup)
+        self._run_compile_test(f, k_add_inplace_3d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_vsplit_mutate(self):
+        """Test: clone then vsplit (returns tuple of views), mutate one slice.
+
+        torch.vsplit() vertically splits array into multiple sub-arrays (views).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then vsplit - vsplit returns tuple of views
+            x_clone = x.clone()
+            x_parts = torch.vsplit(x_clone, 2)  # split (4, 8) -> 2x (2, 8)
+            y_parts = torch.vsplit(y, 2)
+            # Mutate just the first part
+            result = k_add_inplace(x_parts[0], y_parts[0])
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x[:2, :].clone(), y[:2, :].clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_as_strided_mutate(self):
+        """Test: clone then as_strided (a view op), mutate, original unchanged.
+
+        torch.as_strided() creates a view with specified strides.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then as_strided - as_strided is a view
+            x_clone = x.clone()
+            # Create a strided view: take every other column
+            x_strided = torch.as_strided(x_clone, (4, 4), (8, 2))
+            y_strided = torch.as_strided(y, (4, 4), (8, 2))
+            result = k_add_inplace(x_strided, y_strided)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            torch.as_strided(x.clone(), (4, 4), (8, 2)),
+            torch.as_strided(y.clone(), (4, 4), (8, 2)),
+        )
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_with_multiple_views_one_mutated(self):
+        """Test: clone with multiple views, only one is mutated.
+
+        This tests that when a clone has multiple views and only one is mutated,
+        the other view correctly sees the mutation (since both views share the
+        same clone's storage in eager mode).
+
+        The fix works by detecting whether the original tensor (before clone) has
+        direct (non-view) uses in the output. If all uses of the original go through
+        views (sibling views of the mutated input), we don't clone at Inductor level,
+        allowing the mutation to propagate correctly to sibling views.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_inplace_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """1D in-place add."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + y[tile]
+            return x
+
+        k_add_inplace_1d.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then create two different views
+            x_clone = x.clone()
+            x_flat = x_clone.flatten()  # view 1 - will be mutated
+            x_transposed = x_clone.t()  # view 2 - not mutated, used in output
+            y_flat = y.flatten()
+            result = k_add_inplace_1d(x_flat, y_flat)
+            result = torch.relu(result) + 1.0
+            # x_transposed should use pre-mutation value (same as x.t() since clone was made)
+            return result, x_transposed.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.flatten().clone(), y.flatten().clone())
+        k_add_inplace_1d.reset()
+        _ = k_add_inplace_1d(*warmup)
+        self._run_compile_test(f, k_add_inplace_1d, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_conj_mutate(self):
+        """Test: clone then conj (a view op for complex tensors), mutate, original unchanged.
+
+        torch.conj() returns a conjugate view. For real tensors, it returns
+        the input unchanged (a view).
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then conj - conj is a view (for real tensors, returns input unchanged)
+            x_clone = x.clone()
+            x_conj = torch.conj(x_clone)
+            y_conj = torch.conj(y)
+            result = k_add_inplace(x_conj, y_conj)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (torch.conj(x.clone()), torch.conj(y.clone()))
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_two_clones_of_same_tensor_both_mutated(self):
+        """Test: create two clones of same tensor, pass both to kernel, both mutated.
+
+        This tests that when two independent clones are made from the same tensor
+        and both are passed to the kernel as different arguments, the original
+        tensor remains unchanged and both clones receive independent mutations.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_two_inplace(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """Add 1 to x and 2 to y (mutates both)."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + 1
+                y[tile] = y[tile] + 2
+            return x + y
+
+        k_add_two_inplace.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            # Create two independent clones of x
+            clone1 = x.clone()
+            clone2 = x.clone()
+            # Both clones are mutated
+            result = k_add_two_inplace(clone1, clone2)
+            result = torch.relu(result) + 1.0
+            # x should be unchanged (both mutations happened to clones)
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+            torch.randn(4, 8, device=DEVICE, dtype=torch.float16),
+        )
+        k_add_two_inplace.reset()
+        _ = k_add_two_inplace(*warmup)
+        self._run_compile_test(f, k_add_two_inplace, (x,), warmup_args=warmup)
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_passed_to_two_kernels(self):
+        """Test: same clone passed to two different kernels in sequence.
+
+        The first kernel mutates the clone, then a second kernel uses it.
+        The original tensor should remain unchanged.
+
+        Uses graph-level clone cache to share clones across kernels.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_one(x: torch.Tensor) -> torch.Tensor:
+            """Add 1 to x."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] + 1
+            return x
+
+        @helion.kernel(autotune_effort="none")
+        def k_mul_two(x: torch.Tensor) -> torch.Tensor:
+            """Multiply x by 2."""
+            for tile in hl.tile(x.size()):
+                x[tile] = x[tile] * 2
+            return x
+
+        k_add_one.settings._wip_experimental_allow_torch_compile_fusion = True
+        k_mul_two.settings._wip_experimental_allow_torch_compile_fusion = True
+
+        def f(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            x_clone = x.clone()
+            # First kernel mutates clone
+            _ = k_add_one(x_clone)
+            # Second kernel mutates same clone
+            result = k_mul_two(x_clone)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup1 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup2 = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        k_add_one.reset()
+        k_mul_two.reset()
+        _ = k_add_one(warmup1)
+        _ = k_mul_two(warmup2)
+        self._run_compile_test(f, k_add_one, (x,), warmup_args=(warmup1,))
+
+    @skipIfRocm("torch.compile missing kernel metadata on ROCm")
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_clone_then_repeat_mutate(self):
+        """Test: clone then repeat (expansion), mutate.
+
+        repeat(1,1) is a no-op that may be optimized away. Clone detection
+        traces through no-op repeats to find the underlying clone.
+        """
+
+        def f(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            x = x * 2.0
+            y = y * 2.0
+            # Clone then repeat (repeat creates a new tensor, not a view)
+            x_clone = x.clone()
+            x_repeated = x_clone.repeat(1, 1)  # Same shape, but new tensor
+            result = k_add_inplace(x_repeated, y)
+            result = torch.relu(result) + 1.0
+            # x.sum() should use pre-mutation value of x
+            return result, x.sum()
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 8, device=DEVICE, dtype=torch.float16)
+        warmup = (x.clone(), y.clone())
+        self._run_compile_test(f, k_add_inplace, (x, y), warmup_args=warmup)
 
 
 if __name__ == "__main__":
